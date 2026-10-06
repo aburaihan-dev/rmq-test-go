@@ -1,0 +1,7 @@
+# Local settings, including the broker login. Copy .env.example to .env.
+.env
+
+# Built binaries (see the README's Build section): rebuild them instead of committing them.
+rmq-go
+rmq-go.exe
+rmq-go-*

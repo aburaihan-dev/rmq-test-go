@@ -91,9 +91,84 @@ The settings in `.env` (everything but the last is required; see [.env.example](
 
 A queue's type cannot change once it exists: starting with a different `RABBITMQ_QUEUE_TYPE` for an existing queue name fails with the broker's `PRECONDITION_FAILED ... inequivalent arg 'x-queue-type'`. Use a new queue name, or delete the old queue yourself (the app never deletes anything).
 
-To try it without building, use `go run . -rate 5`.
-
 To deploy, copy the binary and a `.env` to the target machine; Go is not needed there. Real environment variables take precedence over values in `.env`.
+
+### Examples
+
+Run these from the folder that holds the binary and `.env`. Ctrl+C stops any of them.
+
+Send one message per second (the default rate):
+
+```powershell
+.\rmq-go.exe
+```
+
+Send 10 messages per second:
+
+```powershell
+.\rmq-go.exe -rate 10
+```
+
+Simulate a slow consumer: send 10 per second, but wait a random time of up to 400 ms before reading each message. The consumer then averages about 5 messages per second, so a backlog builds up in the queue:
+
+```powershell
+.\rmq-go.exe -rate 10 -read-delay 400ms
+```
+
+Run straight from the source, without building (flags go after the `.`):
+
+```powershell
+go run . -rate 5 -read-delay 1s
+```
+
+On Linux (see [Running on Linux](#running-on-linux)):
+
+```bash
+./rmq-go-linux-amd64 -rate 5 -read-delay 500ms
+```
+
+Use a classic queue instead of a quorum queue by setting the type in `.env` (the other settings stay as they are):
+
+```
+RABBITMQ_QUEUE=demo.classic
+RABBITMQ_QUEUE_TYPE=classic
+```
+
+Or try the other type for a single run without editing `.env`. Real environment variables win over `.env`, and the queue needs a new name because the type of an existing queue cannot change:
+
+```powershell
+$env:RABBITMQ_QUEUE = "demo.classic"; $env:RABBITMQ_QUEUE_TYPE = "classic"
+.\rmq-go.exe -rate 5
+Remove-Item Env:RABBITMQ_QUEUE, Env:RABBITMQ_QUEUE_TYPE    # PowerShell keeps them for the whole session
+```
+
+```bash
+RABBITMQ_QUEUE=demo.classic RABBITMQ_QUEUE_TYPE=classic ./rmq-go-linux-amd64 -rate 5
+```
+
+#### What the output looks like
+
+`.\rmq-go.exe -rate 5` prints something like this (timestamps and random strings differ on every run):
+
+```
+2026/10/06 16:04:11.379588 INFO connected host=localhost:5672 vhost=demo
+2026/10/06 16:04:11.395397 INFO queue ready name=demo.quorum type=quorum
+2026/10/06 16:04:11.399672 INFO producing; press Ctrl+C to stop rate=5/s
+2026/10/06 16:04:11.400690 INFO SENT random=RA2IQSK5QS6Z6SIU74COCFLCXP ts=2026-10-06T16:04:11.400+06:00
+2026/10/06 16:04:11.409385 INFO RECV random=RA2IQSK5QS6Z6SIU74COCFLCXP ts=2026-10-06T16:04:11.400+06:00
+...
+2026/10/06 16:04:17.329440 INFO stopping
+```
+
+Each `SENT` line pairs with the `RECV` line that has the same `random=` value, and `ts=` is when the message was created. With `-read-delay`, the startup log says the option is on and each `RECV` line also shows how long that message waited (illustrative):
+
+```
+2026/10/06 16:10:02.103000 INFO random read delay on max=400ms
+2026/10/06 16:10:02.104000 INFO SENT random=K7QXJ3M2WZP4NB6TR5DYH2VFGA ts=2026-10-06T16:10:02.104+06:00
+2026/10/06 16:10:02.331000 INFO RECV random=K7QXJ3M2WZP4NB6TR5DYH2VFGA ts=2026-10-06T16:10:02.104+06:00 delay=226ms
+```
+
+A message that is not valid JSON is logged as `WARN RECV err=... body=...` and still acknowledged.
 
 ### Running on Linux
 
