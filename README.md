@@ -77,9 +77,9 @@ On Linux or macOS: `./rmq-go -rate 5`.
 | `-rate N` | Messages sent per second, 1-1000 (default 1). |
 | `-read-delay D` | Wait a random time between 0 and `D` (for example `500ms` or `2s`, at most `10s`) before each message is read; the `RECV` line shows the wait as `delay=`. Off by default. |
 
-Messages are read one at a time, so a read delay slows the consumer down: if the average wait (`D/2`) is longer than the gap between messages, a backlog builds up in the queue.
+Each consumer thread reads one message at a time, so a read delay slows it down: a thread manages about `2/D` messages a second (the average wait is `D/2`). If all the threads together (see `RABBITMQ_CONSUMER_THREADS` below) manage fewer than `-rate`, a backlog builds up in the queue.
 
-The settings in `.env` (everything but the last is required; see [.env.example](.env.example)):
+The settings in `.env` (the last two are optional, the rest are required; see [.env.example](.env.example)):
 
 | Key | Meaning |
 |---|---|
@@ -88,6 +88,7 @@ The settings in `.env` (everything but the last is required; see [.env.example](
 | `RABBITMQ_VHOST` | Virtual host; it must already exist. |
 | `RABBITMQ_QUEUE` | Queue name; the queue is declared on start if it does not exist. |
 | `RABBITMQ_QUEUE_TYPE` | `quorum` (default when unset or empty) or `classic`, in any letter case. Anything else stops the app at start. |
+| `RABBITMQ_CONSUMER_THREADS` | How many messages the consumer handles at the same time: a whole number from 1 to 100, default 1. The threads share one consumer. With more than one, the startup log shows the count, each `RECV` line ends with `thread=` (the thread that handled it) and `RECV` lines can come out in a different order than the `SENT` lines. Anything invalid stops the app at start. |
 
 A queue's type cannot change once it exists: starting with a different `RABBITMQ_QUEUE_TYPE` for an existing queue name fails with the broker's `PRECONDITION_FAILED ... inequivalent arg 'x-queue-type'`. Use a new queue name, or delete the old queue yourself (the app never deletes anything).
 
@@ -109,10 +110,22 @@ Send 10 messages per second:
 .\rmq-go.exe -rate 10
 ```
 
-Simulate a slow consumer: send 10 per second, but wait a random time of up to 400 ms before reading each message. The consumer then averages about 5 messages per second, so a backlog builds up in the queue:
+Simulate a slow consumer: send 10 per second, but wait a random time of up to 400 ms before reading each message. With the default single thread the consumer averages about 5 messages per second, so a backlog builds up in the queue:
 
 ```powershell
 .\rmq-go.exe -rate 10 -read-delay 400ms
+```
+
+Catch up with several consumer threads. Set the count in `.env`:
+
+```
+RABBITMQ_CONSUMER_THREADS=20
+```
+
+Twenty threads, each averaging 5 messages a second with that read delay, keep up with 100 messages a second, so no backlog builds up:
+
+```powershell
+.\rmq-go.exe -rate 100 -read-delay 400ms
 ```
 
 Run straight from the source, without building (flags go after the `.`):
@@ -166,6 +179,17 @@ Each `SENT` line pairs with the `RECV` line that has the same `random=` value, a
 2026/10/06 16:10:02.103000 INFO random read delay on max=400ms
 2026/10/06 16:10:02.104000 INFO SENT random=K7QXJ3M2WZP4NB6TR5DYH2VFGA ts=2026-10-06T16:10:02.104+06:00
 2026/10/06 16:10:02.331000 INFO RECV random=K7QXJ3M2WZP4NB6TR5DYH2VFGA ts=2026-10-06T16:10:02.104+06:00 delay=226ms
+```
+
+With more than one consumer thread, the startup log shows the count and each `RECV` line ends with `thread=`, the thread that handled it. The threads finish at different times, so `RECV` lines can come out in a different order than the `SENT` lines (illustrative, 3 threads):
+
+```
+2026/10/06 16:20:11.049000 INFO random read delay on max=400ms
+2026/10/06 16:20:11.050000 INFO consumer threads count=3
+2026/10/06 16:20:11.104000 INFO SENT random=K7QXJ3M2WZP4NB6TR5DYH2VFGA ts=2026-10-06T16:20:11.104+06:00
+2026/10/06 16:20:11.204000 INFO SENT random=3HFD6NQ2PXZTL4WRB7YKM5VJCE ts=2026-10-06T16:20:11.204+06:00
+2026/10/06 16:20:11.251000 INFO RECV random=3HFD6NQ2PXZTL4WRB7YKM5VJCE ts=2026-10-06T16:20:11.204+06:00 delay=46ms thread=1
+2026/10/06 16:20:11.338000 INFO RECV random=K7QXJ3M2WZP4NB6TR5DYH2VFGA ts=2026-10-06T16:20:11.104+06:00 delay=233ms thread=2
 ```
 
 A message that is not valid JSON is logged as `WARN RECV err=... body=...` and still acknowledged.

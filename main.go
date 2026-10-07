@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,7 +24,11 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type config struct{ host, port, user, pass, vhost, queue, qtype string }
+type config struct {
+	host, port, user, pass, vhost, queue, qtype string
+
+	threads int // consumer threads, from RABBITMQ_CONSUMER_THREADS
+}
 
 // payload is the JSON body of every message.
 type payload struct {
@@ -39,7 +44,14 @@ func main() {
 	}
 }
 
-// maxReadDelay caps -read-delay. With a prefetch of 100, a delivery can wait behind 99
+const (
+	// prefetch bounds the unacked deliveries the consumer holds.
+	prefetch = 100
+	// maxThreads caps RABBITMQ_CONSUMER_THREADS at the prefetch, so every thread can hold a message.
+	maxThreads = prefetch
+)
+
+// maxReadDelay caps -read-delay. With a single thread a delivery can wait behind prefetch-1
 // delayed ones, and RabbitMQ closes a channel whose delivery stays unacked for 30 minutes;
 // at a 5 s average delay that wait is about 8 minutes, well clear of the limit.
 const maxReadDelay = 10 * time.Second
@@ -99,7 +111,7 @@ func run() error {
 	slog.Info("queue ready", "name", c.queue, "type", c.qtype)
 
 	// Bound the client-side buffer so a slow terminal can't pile up deliveries.
-	if err := sub.Qos(100, 0, false); err != nil {
+	if err := sub.Qos(prefetch, 0, false); err != nil {
 		return fmt.Errorf("set prefetch: %w", err)
 	}
 	msgs, err := sub.Consume(c.queue, "", false, false, false, false, nil)
@@ -109,8 +121,10 @@ func run() error {
 	if *readDelay > 0 {
 		slog.Info("random read delay on", "max", *readDelay)
 	}
-	consumed := make(chan error, 1)
-	go func() { consumed <- consume(msgs, *readDelay) }()
+	if c.threads > 1 {
+		slog.Info("consumer threads", "count", c.threads)
+	}
+	consumed := startConsumers(msgs, c.threads, *readDelay)
 
 	slog.Info("producing; press Ctrl+C to stop", "rate", fmt.Sprintf("%d/s", *rate))
 	tick := time.NewTicker(time.Second / time.Duration(*rate))
@@ -162,6 +176,16 @@ func loadConfig() (config, error) {
 	default:
 		return c, fmt.Errorf("RABBITMQ_QUEUE_TYPE must be 'classic' or 'quorum', got '%s'", raw)
 	}
+
+	// RABBITMQ_CONSUMER_THREADS is optional: unset or empty means 1.
+	c.threads = 1
+	if orig := os.Getenv("RABBITMQ_CONSUMER_THREADS"); strings.TrimSpace(orig) != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(orig))
+		if err != nil || n < 1 || n > maxThreads {
+			return c, fmt.Errorf("RABBITMQ_CONSUMER_THREADS must be a whole number from 1 to %d, got '%s'", maxThreads, orig)
+		}
+		c.threads = n
+	}
 	return c, nil
 }
 
@@ -183,24 +207,49 @@ func publish(ctx context.Context, ch *amqp.Channel, queue string) error {
 	return nil
 }
 
+// startConsumers starts threads goroutines that all read from msgs, so up to that many
+// messages are handled at once, and returns a channel that receives the first failure of
+// any of them.
+//
+// ponytail: the threads share one AMQP consumer and its prefetch window, so the broker does
+// no per-thread balancing. Use one channel and consumer per thread if that ever matters.
+func startConsumers(msgs <-chan amqp.Delivery, threads int, maxDelay time.Duration) <-chan error {
+	failed := make(chan error, 1)
+	for i := 1; i <= threads; i++ {
+		id := i
+		if threads == 1 {
+			id = 0 // a single reader needs no thread= on its log lines
+		}
+		go func() {
+			err := consume(msgs, maxDelay, id)
+			select {
+			case failed <- err:
+			default: // only the first failure matters
+			}
+		}()
+	}
+	return failed
+}
+
 // consume logs and acks deliveries until the delivery channel closes. With maxDelay > 0
-// each message first waits a random time in [0, maxDelay) and the RECV line shows it.
-func consume(msgs <-chan amqp.Delivery, maxDelay time.Duration) error {
+// each message first waits a random time in [0, maxDelay) and the RECV line shows it. A
+// thread number above 0 is shown as thread=<n>.
+func consume(msgs <-chan amqp.Delivery, maxDelay time.Duration, thread int) error {
 	for d := range msgs {
-		var delay []any // becomes delay=<wait> on the log line when the option is on
+		var extra []any // trailing log attributes: delay=<wait> and thread=<n>, each only when in use
 		if maxDelay > 0 {
-			// ponytail: messages are read one at a time, so delays add up and the consumer
-			// manages at most 1/average-delay per second. Handle each delivery in its own
-			// goroutine to overlap them.
 			wait := mrand.N(maxDelay)
 			time.Sleep(wait)
-			delay = []any{"delay", wait.Round(time.Millisecond)}
+			extra = append(extra, "delay", wait.Round(time.Millisecond))
+		}
+		if thread > 0 {
+			extra = append(extra, "thread", thread)
 		}
 		var p payload
 		if err := json.Unmarshal(d.Body, &p); err != nil {
-			slog.Warn("RECV", append([]any{"err", err, "body", string(d.Body)}, delay...)...)
+			slog.Warn("RECV", append([]any{"err", err, "body", string(d.Body)}, extra...)...)
 		} else {
-			slog.Info("RECV", append([]any{"random", p.Random, "ts", p.Timestamp}, delay...)...)
+			slog.Info("RECV", append([]any{"random", p.Random, "ts", p.Timestamp}, extra...)...)
 		}
 		if err := d.Ack(false); err != nil {
 			return fmt.Errorf("ack: %w", err)
